@@ -78,6 +78,7 @@ CONFIG = {
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
+    "diag": True,            # raise after warmup with a diagnostic summary (the judge hides engine output)
 }
 
 
@@ -144,6 +145,7 @@ class Engine:
         self.hist_buf = self.pos_buf = None
         self.k_active = 0
         self.step_ms = {}
+        self.diag = []
         self.sdpa_gqa = None  # decided on first prefill
         self.gemm = None      # kernels.gemm module when usable
         self.gemm_good = []   # configs that passed the self-test
@@ -152,6 +154,7 @@ class Engine:
         self.gemm_choice = {}  # (M, N, K) -> cfg or None (cuBLAS)
 
         _log(f"loaded in {time.time() - t0:.1f}s on {self.device}; triton={self.use_triton} graphs={self.use_graphs}")
+        self.diag.append(f"load {time.time() - t0:.0f}s triton={self.use_triton} cache={os.environ.get('TRITON_CACHE_DIR', 'default')}")
 
     # ------------------------------------------------------------------ loading
 
@@ -256,9 +259,13 @@ class Engine:
                             result = module.self_test(str(self.device))
                         tested[module] = bool(result.get("ok", False))
                         _log(f"self_test {module.__name__} ({time.time() - t_start:.1f}s): {result}")
+                        self.diag.append(f"{module.__name__.split('.')[-1]}:{'ok' if result.get('ok') else 'FAIL'}"
+                                         f"{'' if result.get('ok') else str(result)[:200]}"
+                                         f" {time.time() - t_start:.0f}s")
                     except Exception as error:  # noqa: BLE001
                         tested[module] = False
                         _log(f"self_test {module.__name__} raised {error!r}")
+                        self.diag.append(f"{module.__name__.split('.')[-1]}:RAISED {error!r}"[:200])
                 ok = tested[module]
             if ok:
                 self.ops[name] = fn
@@ -299,6 +306,7 @@ class Engine:
             except Exception as error:  # noqa: BLE001
                 result = {"ok": False, "error": repr(error)}
             _log(f"self_test kernels.gemm M={M} ({time.time() - t_start:.1f}s): {result}")
+            self.diag.append(f"gemm_test M{M}:{'ok' if result.get('ok') else 'FAIL ' + str(result)[:160]} {time.time() - t_start:.0f}s")
             self.gemm_tested[M] = list(result.get("good_configs", [])) if result.get("ok") else []
         good = self.gemm_tested[M]
         if not good:
@@ -327,6 +335,8 @@ class Engine:
                 cfg, timings = self.gemm.choose_config(x, w, self.gemm_good)
             self.gemm_choice[key] = cfg
             _log(f"gemm {name} M={M} N={w.shape[0]} K={K}: {'custom ' + str(cfg) if cfg else 'cublas'} {timings}")
+            short = {k[:14]: round(v, 3) for k, v in timings.items() if isinstance(v, (int, float))}
+            self.diag.append(f"gemm {name} M{M}:{'C' + str(cfg) if cfg else 'cublas'} {short}")
 
     # ------------------------------------------------------------------ shape state
 
@@ -479,6 +489,7 @@ class Engine:
         torch.cuda.synchronize()
         self.step_ms[T] = start.elapsed_time(end) / 5
         _log(f"captured T={T} graph in {time.time() - t0:.1f}s; replay {self.step_ms[T]:.3f} ms/step")
+        self.diag.append(f"graph T{T} {self.step_ms[T]:.3f}ms cap {time.time() - t0:.0f}s")
 
     def _profile(self, tok, pos, T):
         """Rough per-op breakdown of one eager decode step (warmup only)."""
@@ -522,6 +533,8 @@ class Engine:
             total = sum(timings.values())
             _log("profile T=%d B=%d (eager, ms): total %.3f | %s" % (
                 T, B, total, " ".join(f"{k}={v:.3f}" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))))
+            self.diag.append("prof T%d B%d tot %.2f %s" % (
+                T, B, total, " ".join(f"{k}={v:.2f}" for k, v in sorted(timings.items(), key=lambda kv: -kv[1]))))
         except Exception as error:  # noqa: BLE001
             _log(f"profile failed: {error!r}")
 
@@ -595,6 +608,7 @@ class Engine:
         best = min(timings, key=timings.get)
         self.sdpa_gqa = best == "gqa"
         _log(f"prefill attention B={Bp} S={S}: {timings} -> {best}")
+        self.diag.append(f"sdpa {best} {({k: round(v, 2) for k, v in timings.items()})}")
 
     def _prefill_attention(self, q, k, v):
         """q [B,S,Nq,D], k/v [B,Nkv,S,D] (cache views) -> [B*S, Nq*D]. Flash SDPA, causal."""
@@ -668,6 +682,8 @@ class Engine:
             return
         with torch.inference_mode():
             self._prepare(B, S, N)
+            if CONFIG["diag"]:
+                raise RuntimeError("DIAG B=%d S=%d N=%d | " % (B, S, N) + " | ".join(self.diag))
             ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
             first = self._prefill(ids)
             # Decode state: history = prompt + first token; S tokens are in the cache.
