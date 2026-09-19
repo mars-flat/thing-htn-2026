@@ -74,13 +74,13 @@ CONFIG = {
     "self_test": True,       # verify each Triton kernel against its torch twin at load
     "profile": True,         # print a per-op timing breakdown during warmup
     "small_gemm": "auto",    # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
-    "spec_k": 4,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
+    "spec_k": 0,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
     "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
-    "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
-    "warmup_budget_s": 200,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
+    "fused": False,          # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
+    "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
 }
 
 
@@ -167,13 +167,27 @@ class Engine:
     def _load_weights(self, model_path):
         from transformers import AutoModelForCausalLM
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-            local_files_only=True,
-        ).eval()
-        model.to(self.device)
+        model = None
+        if self.is_cuda:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="sdpa",
+                    local_files_only=True,
+                    device_map={"": str(self.device)},
+                ).eval()
+            except Exception as error:  # noqa: BLE001 - accelerate missing, etc.
+                _log(f"device_map load unavailable ({error!r}); loading on CPU first")
+                model = None
+        if model is None:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+                local_files_only=True,
+            ).eval()
+            model.to(self.device)
         base = model.model
         self.layers = []
         for layer in base.layers:
@@ -337,6 +351,10 @@ class Engine:
         chosen, report = {}, []
         for key, (variant, xin, w, kw) in plan.items():
             best, best_ms = None, float("inf")
+            if self._over_budget():
+                _log("fused: benchmark cut short (warmup budget)")
+                self.fused_cfg[M] = None
+                return
             for cfg in result["variants"][variant]["good"]:
                 try:
                     ms = self.fused.bench(lambda: self.fused.fused_linear(xin, w, cfg, **kw))
@@ -470,7 +488,6 @@ class Engine:
             self._choose_fused(B)
             if k:
                 self._choose_gemms(B * (k + 1))
-                self._choose_fused(B * (k + 1))
         if self.use_graphs:
             if 1 not in self.graphs:
                 self._capture_best(1)
