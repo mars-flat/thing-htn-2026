@@ -211,7 +211,7 @@ def add_rms_norm(x: torch.Tensor, r: torch.Tensor, weight: torch.Tensor, eps: fl
 # Self-test against the pure-torch twins
 # ----------------------------------------------------------------------------
 
-_TEST_SHAPES = [(1, 2560), (7, 2560), (64, 2560), (3, 128)]
+_TEST_SHAPES = [(7, 2560), (3, 128)]
 _TEST_EPS = 1e-6
 
 

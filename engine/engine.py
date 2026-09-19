@@ -74,11 +74,13 @@ CONFIG = {
     "self_test": True,       # verify each Triton kernel against its torch twin at load
     "profile": True,         # print a per-op timing breakdown during warmup
     "small_gemm": "auto",    # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
-    "spec_k": 4,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
+    "spec_k": 0,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
     "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
+    "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
+    "warmup_budget_s": 200,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
 }
 
 
@@ -132,11 +134,6 @@ class Engine:
         if cfg.get("rope_scaling") is not None:
             raise RuntimeError("rope_scaling is not supported by this engine")
 
-        self._load_weights(model_path)
-        self._rope_max = 0
-        self._ensure_rope(8192)
-        self._select_ops()
-
         # Per-shape state.
         self.B = self.CAP = 0
         self.k_cache = self.v_cache = None
@@ -146,12 +143,21 @@ class Engine:
         self.k_active = 0
         self.step_ms = {}
         self.diag = []
+        self.fused = None          # kernels.gemm_fused module when importable
+        self.fused_cfg = {}        # M -> {variant: cfg} or None
+        self.use_fused = {}        # M -> bool (decided by whole-step timing)
+        self.t_start = t0
         self.sdpa_gqa = None  # decided on first prefill
         self.gemm = None      # kernels.gemm module when usable
         self.gemm_good = []   # configs that passed the self-test
         self.gemm_tested = {}  # M -> good configs
         self.gemm_force = False
         self.gemm_choice = {}  # (M, N, K) -> cfg or None (cuBLAS)
+
+        self._load_weights(model_path)
+        self._rope_max = 0
+        self._ensure_rope(8192)
+        self._select_ops()
 
         _log(f"loaded in {time.time() - t0:.1f}s on {self.device}; triton={self.use_triton} graphs={self.use_graphs}")
         self.diag.append(f"load {time.time() - t0:.0f}s triton={self.use_triton} cache={os.environ.get('TRITON_CACHE_DIR', 'default')}")
@@ -283,8 +289,93 @@ class Engine:
                     self.gemm_force = mode in (True, "1", "true", "on")
             except Exception as error:  # noqa: BLE001
                 _log(f"gemm kernel unavailable ({error!r}); cuBLAS only")
+        mode = os.environ.get("DRYFT_ENGINE_FUSED", CONFIG["fused"])
+        if mode not in (False, "0", "false", "off"):
+            try:
+                from kernels import gemm_fused
+
+                if gemm_fused.HAS_TRITON:
+                    self.fused = gemm_fused
+            except Exception as error:  # noqa: BLE001
+                _log(f"fused gemm unavailable ({error!r})")
         if self.is_cuda:
             torch.cuda.synchronize()
+
+    def _over_budget(self):
+        return time.time() - self.t_start > CONFIG["warmup_budget_s"]
+
+    def _choose_fused(self, M):
+        """Self-test the fused GEMM variants at M rows and pick the fastest good config per variant."""
+        if self.fused is None or M > 16 or M in self.fused_cfg:
+            return
+        if self._over_budget():
+            _log("fused: skipped (warmup budget)")
+            self.fused_cfg[M] = None
+            return
+        t_start = time.time()
+        try:
+            result = self.fused.self_test(str(self.device), M=M, H=self.H, I=self.I, NQ=self.Nq, NKV=self.Nkv, D=self.D)
+        except Exception as error:  # noqa: BLE001
+            result = {"ok": False, "error": repr(error)}
+        _log(f"self_test kernels.gemm_fused M={M} ({time.time() - t_start:.1f}s): {result}")
+        self.diag.append(f"fused_test M{M}:{'ok' if result.get('ok') else 'FAIL ' + str(result)[:200]} {time.time() - t_start:.0f}s")
+        if not result.get("ok"):
+            self.fused_cfg[M] = None
+            return
+        first = self.layers[0]
+        x = torch.randn((M, self.H), dtype=torch.bfloat16, device=self.device)
+        a = torch.randn((M, self.Nq * self.D), dtype=torch.bfloat16, device=self.device)
+        pp = torch.randn((M, self.I), dtype=torch.bfloat16, device=self.device)
+        res = torch.randn((M, self.H), dtype=torch.bfloat16, device=self.device)
+        plan = {
+            "qkv": ("norm_qkv", x, first.w_qkv, dict(norm_w=first.ln1, eps=self.eps)),
+            "o": ("o_res", a, first.w_o, dict(residual=res)),
+            "gu": ("norm_gu_silu", x, first.w_gu, dict(norm_w=first.ln2, eps=self.eps, silu_pair=True)),
+            "down": ("down_res", pp, first.w_down, dict(residual=res)),
+            "lm": ("norm_qkv", x, self.lm_head, dict(norm_w=self.final_norm, eps=self.eps)),
+        }
+        chosen, report = {}, []
+        for key, (variant, xin, w, kw) in plan.items():
+            best, best_ms = None, float("inf")
+            for cfg in result["variants"][variant]["good"]:
+                try:
+                    ms = self.fused.bench(lambda: self.fused.fused_linear(xin, w, cfg, **kw))
+                except Exception as error:  # noqa: BLE001
+                    _log(f"fused {key} {cfg} failed: {error!r}")
+                    continue
+                if ms < best_ms:
+                    best, best_ms = cfg, ms
+            if best is None:
+                self.fused_cfg[M] = None
+                _log(f"fused: no working config for {key}")
+                return
+            chosen[key] = best
+            report.append(f"{key}={best_ms:.3f}ms{best}")
+        self.fused_cfg[M] = chosen
+        _log(f"fused configs M={M}: {' '.join(report)}")
+        self.diag.append(f"fused M{M} {' '.join(report)}")
+
+    def _step_fused(self, tok, pos, T):
+        """Decode step with fused GEMMs (norm prologues, residual / SwiGLU epilogues). M = B*T <= 16."""
+        ops = self.ops
+        B = tok.shape[0]
+        M = B * T
+        cfg = self.fused_cfg[M]
+        fl = self.fused.fused_linear
+        lengths = pos + T
+        h = F.embedding(tok.reshape(-1), self.embed)
+        for l, w in enumerate(self.layers):
+            qkv = fl(h, w.w_qkv, cfg["qkv"], norm_w=w.ln1, eps=self.eps)
+            q = ops["qk_norm_rope_cache"](
+                qkv, w.q_norm, w.k_norm, self.eps, self.cos_tab, self.sin_tab, pos, T,
+                self.k_cache[l], self.v_cache[l],
+            )
+            a = ops["attn_decode"](q, self.k_cache[l], self.v_cache[l], lengths, self.scale, self.num_splits)
+            h = fl(a.view(M, -1), w.w_o, cfg["o"], residual=h)
+            p = fl(h, w.w_gu, cfg["gu"], norm_w=w.ln2, eps=self.eps, silu_pair=True)
+            h = fl(p, w.w_down, cfg["down"], residual=h)
+        logits = fl(h, self.lm_head, cfg["lm"], norm_w=self.final_norm, eps=self.eps)
+        return logits.argmax(dim=-1)
 
     def _lin(self, x, w):
         """x @ w.T with the per-shape choice made at warmup (custom kernel or cuBLAS)."""
@@ -376,15 +467,68 @@ class Engine:
                  f"kv={2 * self.L * B * self.Nkv * cap * self.D * 2 / 2**30:.2f}GiB")
         if self.is_cuda:
             self._choose_gemms(B)
+            self._choose_fused(B)
             if k:
                 self._choose_gemms(B * (k + 1))
+                self._choose_fused(B * (k + 1))
         if self.use_graphs:
             if 1 not in self.graphs:
-                self._capture(1)
+                self._capture_best(1)
             if k and (k + 1) not in self.graphs:
-                self._capture(k + 1)
+                if self._over_budget():
+                    _log("spec: skipped (warmup budget)")
+                    self.k_active = 0
+                else:
+                    try:
+                        self._capture_best(k + 1)
+                    except Exception as error:  # noqa: BLE001
+                        _log(f"spec capture failed ({error!r}); plain decoding only")
+                        self.diag.append(f"spec capture FAILED {error!r}"[:200])
+                        self.graphs.pop(k + 1, None)
+                        self.k_active = 0
+                        if self.is_cuda:
+                            torch.cuda.synchronize()
+        elif self.is_cuda and k:
+            self.k_active = k
         if self.sdpa_gqa is None and self.is_cuda:
             self._probe_prefill_attention(B, S)
+
+    def _capture_best(self, T):
+        """Capture the step with and without fused GEMMs (when available) and keep the faster graph."""
+        M = self.B * T
+        candidates = [False]
+        if self.fused_cfg.get(M):
+            mode = os.environ.get("DRYFT_ENGINE_FUSED", CONFIG["fused"])
+            candidates = [True, False] if mode in (True, "1", "true", "on") else [False, True]
+        best = None
+        for use in candidates:
+            if use and self._over_budget():
+                _log("fused graph: skipped (warmup budget)")
+                break
+            self.use_fused[M] = use
+            try:
+                self._capture(T)
+            except Exception as error:  # noqa: BLE001
+                _log(f"capture T={T} fused={use} failed: {error!r}")
+                self.diag.append(f"capture T{T} fused={use} FAILED {error!r}"[:200])
+                self.graphs.pop(T, None)
+                if self.is_cuda:
+                    torch.cuda.synchronize()
+                if best is None and not use:
+                    raise
+                continue
+            ms = self.step_ms[T]
+            if best is None or ms < best[1] * 0.995:
+                best = (use, ms, self.graphs[T])
+            if use and best[0] and candidates[0] is True:
+                break  # forced mode: fused captured fine, no need for the unfused variant
+        if best is None:
+            raise RuntimeError(f"no graph captured for T={T}")
+        self.use_fused[M] = best[0]
+        self.graphs[T] = best[2]
+        self.step_ms[T] = best[1]
+        _log(f"T={T}: using {'fused' if best[0] else 'unfused'} step, {best[1]:.3f} ms")
+        self.diag.append(f"T{T} {'fused' if best[0] else 'unfused'} {best[1]:.3f}ms")
 
     # ------------------------------------------------------------------ decode steps (device-agnostic)
 
@@ -545,6 +689,8 @@ class Engine:
         ops = self.ops
         B = tok.shape[0]
         M = B * T
+        if self.use_fused.get(M):
+            return self._step_fused(tok, pos, T)
         lengths = pos + T
         x = F.embedding(tok.reshape(-1), self.embed)
         h, d = x, None

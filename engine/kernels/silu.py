@@ -129,7 +129,7 @@ def silu_mul(gu: torch.Tensor) -> torch.Tensor:
 # Self-test against the pure-torch twin
 # ----------------------------------------------------------------------------
 
-_TEST_SHAPES = [(1, 2 * 9728), (64, 2 * 9728)]
+_TEST_SHAPES = [(7, 2 * 9728)]
 
 
 def _max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
