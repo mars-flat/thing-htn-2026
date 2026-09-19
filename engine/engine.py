@@ -23,6 +23,7 @@ Structure of one generate() call:
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from collections import deque
@@ -79,8 +80,10 @@ CONFIG = {
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
     "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
-    "fused": False,          # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
+    "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
+    "probe": True,           # compile + self-test Triton kernels in a child process (a crash there only disables a kernel)
+    "probe_timeout_s": 150,
 }
 
 
@@ -144,6 +147,9 @@ class Engine:
         self.step_ms = {}
         self.diag = []
         self.fused = None          # kernels.gemm_fused module when importable
+        self.fused_good = {}       # M -> {variant: [good cfgs]} from the probe
+        self.kernel_candidates = []  # (op name, module, fn) awaiting certification
+        self.probed = False
         self.fused_cfg = {}        # M -> {variant: cfg} or None
         self.use_fused = {}        # M -> bool (decided by whole-step timing)
         self.t_start = t0
@@ -260,6 +266,9 @@ class Engine:
             ("attn_decode", attention, attention.attn_decode),
         ]
         tested = {}
+        if CONFIG["probe"] and self.is_cuda:
+            self.kernel_candidates = [c for c in candidates if getattr(c[1], "HAS_TRITON", False)]
+            candidates = []  # certified later by the child-process probe (first generate call)
         for name, module, fn in candidates:
             if not getattr(module, "HAS_TRITON", False):
                 _log(f"{name}: triton missing, torch twin")
@@ -318,6 +327,89 @@ class Engine:
     def _over_budget(self):
         return time.time() - self.t_start > CONFIG["warmup_budget_s"]
 
+    def _run_probe(self, M, max_T):
+        """Compile + self-test every Triton kernel in a child process (see kernels/probe.py)."""
+        tests = [name for name, _, _ in self.kernel_candidates]
+        names = {"rms_norm": "rmsnorm", "add_rms_norm": "rmsnorm", "silu_mul": "silu",
+                 "qk_norm_rope_cache": "rope", "attn_decode": "attention"}
+        modules = sorted({names[n] for n in tests if n in names})
+        if self.gemm is not None:
+            modules.append("gemm")
+        if self.fused is not None:
+            modules.append("fused")
+        if not modules:
+            return {}
+        root = os.path.dirname(os.path.abspath(__file__))
+        out_path = os.path.join(os.environ.get("TRITON_CACHE_DIR", root if os.access(root, os.W_OK) else "/tmp"),
+                                f"probe_{os.getpid()}_{M}.json")
+        remaining = CONFIG["warmup_budget_s"] - (time.time() - self.t_start)
+        timeout = max(30.0, min(float(CONFIG["probe_timeout_s"]), remaining + 30.0))
+        cmd = [sys.executable, "-m", "kernels.probe", out_path, "--device", str(self.device), "--M", str(M),
+               "--H", str(self.H), "--I", str(self.I), "--NQ", str(self.Nq), "--NKV", str(self.Nkv), "--D", str(self.D),
+               "--max-T", str(max_T), "--tests", ",".join(modules)]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        t0 = time.time()
+        status = "ok"
+        try:
+            proc = subprocess.run(cmd, cwd=root, env=env, timeout=timeout, capture_output=True, text=True)
+            if proc.returncode != 0:
+                status = f"exit {proc.returncode}"
+            tail = (proc.stderr or "")[-600:]
+        except subprocess.TimeoutExpired as error:
+            status = f"timeout {timeout:.0f}s"
+            tail = (error.stderr or b"")[-600:] if isinstance(error.stderr, (bytes, bytearray)) else str(error.stderr or "")[-600:]
+        results = {}
+        try:
+            with open(out_path) as handle:
+                data = json.load(handle)
+            results = data.get("results", {})
+            if not data.get("ok"):
+                status += " (partial)"
+        except Exception as error:  # noqa: BLE001
+            status += f" (no results: {error!r})"
+        _log(f"probe {modules} M={M}: {status} in {time.time() - t0:.0f}s; stderr tail: {tail!r}")
+        self.diag.append(f"probe {status} {time.time() - t0:.0f}s " + " ".join(
+            f"{k}:{'ok' if (v or {}).get('ok') else 'FAIL'}" for k, v in results.items()))
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        return results
+
+    def _apply_probe(self, M, max_T):
+        """Certify kernels with the child-process probe; anything not certified stays on its torch twin."""
+        if self.probed or not self.kernel_candidates and self.gemm is None and self.fused is None:
+            self.probed = True
+            return
+        self.probed = True
+        results = self._run_probe(M, max_T) if not self._over_budget() else {}
+        names = {"rms_norm": "rmsnorm", "add_rms_norm": "rmsnorm", "silu_mul": "silu",
+                 "qk_norm_rope_cache": "rope", "attn_decode": "attention"}
+        for name, module, fn in self.kernel_candidates:
+            res = results.get(names[name]) or {}
+            if res.get("ok"):
+                self.ops[name] = fn
+            else:
+                _log(f"{name}: not certified by probe ({str(res)[:160]}); torch twin")
+        if self.ops["attn_decode"] is not torch_ref.ref_attn_decode:
+            from kernels import attention
+
+            self.choose_num_splits = attention.choose_num_splits
+        if self.gemm is not None:
+            res = results.get("gemm") or {}
+            self.gemm_tested[M] = [tuple(c) for c in res.get("good_configs", [])] if res.get("ok") else []
+            if not self.gemm_tested[M]:
+                _log("gemm: not certified by probe; cuBLAS only")
+        if self.fused is not None:
+            res = results.get("fused") or {}
+            if res.get("ok"):
+                self.fused_good[M] = {k: [tuple(c) for c in v.get("good", [])] for k, v in res.get("variants", {}).items()}
+            else:
+                self.fused_good[M] = None
+                _log("fused: not certified by probe; unfused path")
+        self.kernel_candidates = []
+
     def _choose_fused(self, M):
         """Self-test the fused GEMM variants at M rows and pick the fastest good config per variant."""
         if self.fused is None or M > 16 or M in self.fused_cfg:
@@ -326,16 +418,23 @@ class Engine:
             _log("fused: skipped (warmup budget)")
             self.fused_cfg[M] = None
             return
-        t_start = time.time()
-        try:
-            result = self.fused.self_test(str(self.device), M=M, H=self.H, I=self.I, NQ=self.Nq, NKV=self.Nkv, D=self.D)
-        except Exception as error:  # noqa: BLE001
-            result = {"ok": False, "error": repr(error)}
-        _log(f"self_test kernels.gemm_fused M={M} ({time.time() - t_start:.1f}s): {result}")
-        self.diag.append(f"fused_test M{M}:{'ok' if result.get('ok') else 'FAIL ' + str(result)[:200]} {time.time() - t_start:.0f}s")
-        if not result.get("ok"):
-            self.fused_cfg[M] = None
-            return
+        if M in self.fused_good:
+            good = self.fused_good[M]
+            if not good or not all(good.get(v) for v in ("norm_qkv", "o_res", "norm_gu_silu", "down_res")):
+                self.fused_cfg[M] = None
+                return
+            result = {"ok": True, "variants": {k: {"good": v} for k, v in good.items()}}
+        else:
+            t_start = time.time()
+            try:
+                result = self.fused.self_test(str(self.device), M=M, H=self.H, I=self.I, NQ=self.Nq, NKV=self.Nkv, D=self.D)
+            except Exception as error:  # noqa: BLE001
+                result = {"ok": False, "error": repr(error)}
+            _log(f"self_test kernels.gemm_fused M={M} ({time.time() - t_start:.1f}s): {result}")
+            self.diag.append(f"fused_test M{M}:{'ok' if result.get('ok') else 'FAIL ' + str(result)[:200]} {time.time() - t_start:.0f}s")
+            if not result.get("ok"):
+                self.fused_cfg[M] = None
+                return
         first = self.layers[0]
         x = torch.randn((M, self.H), dtype=torch.bfloat16, device=self.device)
         a = torch.randn((M, self.Nq * self.D), dtype=torch.bfloat16, device=self.device)
@@ -484,6 +583,7 @@ class Engine:
             _log(f"state B={B} CAP={cap} splits={self.num_splits} spec_k={k} "
                  f"kv={2 * self.L * B * self.Nkv * cap * self.D * 2 / 2**30:.2f}GiB")
         if self.is_cuda:
+            self._apply_probe(B, (k + 1) if k else 1)
             self._choose_gemms(B)
             self._choose_fused(B)
             if k:
