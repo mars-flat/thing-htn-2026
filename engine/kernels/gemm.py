@@ -51,13 +51,17 @@ if HAS_TRITON:
         x_ptr,        # [M, K] bf16, row stride stride_xm
         w_ptr,        # [N, K] bf16, row stride stride_wn
         out_ptr,      # SPLIT_K == 1: [M, N] bf16 ; else [SPLIT_K, M, N] fp32
-        M, N, K,
+        M, N, K_PER_SPLIT,   # K_PER_SPLIT = K // SPLIT_K, a multiple of BLOCK_K (host-checked)
         stride_xm, stride_wn, stride_om, stride_os,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         SPLIT_K: tl.constexpr,
     ):
+        # Triton 3.1's axis analysis loses divisibility through `K // SPLIT_K`
+        # computed in-kernel (loads would degrade to scalar, un-pipelined
+        # accesses). Passing K_PER_SPLIT from the host keeps 16-byte vector loads
+        # and the software pipeline on every split-K variant.
         pid_n = tl.program_id(0).to(tl.int64)
         pid_k = tl.program_id(1).to(tl.int64)
         rm = tl.arange(0, BLOCK_M)
@@ -65,19 +69,17 @@ if HAS_TRITON:
         rk = tl.arange(0, BLOCK_K)
         m_mask = rm < M
         n_mask = rn < N
-        k_per_split = K // SPLIT_K                           # host guarantees divisibility by BLOCK_K
-        k0 = pid_k * k_per_split
+        k_base = tl.multiple_of(pid_k * K_PER_SPLIT, BLOCK_K)
 
-        x_ptrs = x_ptr + rm[:, None].to(tl.int64) * stride_xm + k0 + rk[None, :]     # [BLOCK_M, BLOCK_K]
-        w_ptrs = w_ptr + rn[None, :] * stride_wn + k0 + rk[:, None]                  # [BLOCK_K, BLOCK_N] (transposed read)
+        x_row = x_ptr + rm[:, None].to(tl.int64) * stride_xm            # [BLOCK_M, 1]
+        w_col = w_ptr + rn[None, :] * stride_wn                         # [1, BLOCK_N]
 
         acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        for _ in range(0, k_per_split, BLOCK_K):
-            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
-            w = tl.load(w_ptrs, mask=n_mask[None, :], other=0.0)
-            acc += tl.dot(x, w)
-            x_ptrs += BLOCK_K
-            w_ptrs += BLOCK_K
+        for k in range(0, K_PER_SPLIT, BLOCK_K):
+            k0 = k_base + k
+            x = tl.load(x_row + k0 + rk[None, :], mask=m_mask[:, None], other=0.0)   # [BLOCK_M, BLOCK_K]
+            w = tl.load(w_col + k0 + rk[:, None], mask=n_mask[None, :], other=0.0)   # [BLOCK_K, BLOCK_N]
+            acc = tl.dot(x, w, acc)
 
         out_mask = m_mask[:, None] & n_mask[None, :]
         if SPLIT_K == 1:
@@ -125,8 +127,9 @@ def linear_small(x: torch.Tensor, w: torch.Tensor, cfg) -> torch.Tensor:
         )
         return out
     part = torch.empty((split, M, N), dtype=torch.float32, device=x.device)
+    assert (K // split) % block_k == 0
     _gemm_small_kernel[grid](
-        x, w, part, M, N, K, x.stride(0), w.stride(0), part.stride(1), part.stride(0),
+        x, w, part, M, N, K // split, x.stride(0), w.stride(0), part.stride(1), part.stride(0),
         BLOCK_M=BLOCK_M, BLOCK_N=block_n, BLOCK_K=block_k, SPLIT_K=split,
         num_warps=num_warps, num_stages=num_stages,
     )
@@ -138,7 +141,7 @@ def _within(a, b, atol=2e-2, rtol=2.0 / 128):
     return float(diff.max().item()), bool((diff <= atol + rtol * b.float().abs()).all().item())
 
 
-def self_test(device="cuda", shapes=((6144, 2560), (2560, 9728)), rows=(1, 16)) -> dict:
+def self_test(device="cuda", shapes=((6144, 2560), (2560, 4096), (19456, 2560), (2560, 9728)), rows=(1,)) -> dict:
     """Check every config against F.linear on the model's weight shapes. Returns {'ok', 'configs': {...}}."""
     result = {"ok": HAS_TRITON, "configs": {}}
     if not HAS_TRITON:

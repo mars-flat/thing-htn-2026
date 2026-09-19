@@ -75,13 +75,13 @@ CONFIG = {
     "self_test": False,      # module self-tests at load (extra compiles); v4 certifies in-step instead
     "certify": True,         # compare each Triton op against its torch twin on the production shapes during warmup
     "profile": True,         # print a per-op timing breakdown during warmup
-    "small_gemm": False,     # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
+    "small_gemm": "auto",    # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
     "spec_k": 0,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
     "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
-    "fused": False,          # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
+    "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
     "probe": False,          # child-process kernel probe (slow under gVisor; off)
     "probe_timeout_s": 45,    # only the new GEMM kernels are probed; a hung compile costs at most this
@@ -577,6 +577,12 @@ class Engine:
     def _choose_gemms(self, M):
         """Benchmark cuBLAS vs the custom kernel for every weight shape at M rows (warmup only)."""
         if self.gemm is None or M > 16:
+            return
+        if self._over_budget():
+            _log("gemm: skipped (warmup budget)")
+            for name, w in (("qkv", self.layers[0].w_qkv), ("o", self.layers[0].w_o), ("gu", self.layers[0].w_gu),
+                            ("down", self.layers[0].w_down), ("lm_head", self.lm_head)):
+                self.gemm_choice[(M, w.shape[0], w.shape[1])] = None
             return
         if M not in self.gemm_tested:
             t_start = time.time()
