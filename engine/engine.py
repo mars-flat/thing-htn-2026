@@ -75,15 +75,16 @@ CONFIG = {
     "self_test": False,      # module self-tests at load (extra compiles); v4 certifies in-step instead
     "certify": True,         # compare each Triton op against its torch twin on the production shapes during warmup
     "profile": True,         # print a per-op timing breakdown during warmup
-    "small_gemm": "auto",    # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
+    "small_gemm": False,     # Triton weight-streaming GEMM (closed: no gain on public shapes, hidden-shape incorrect_output in G1)
     "spec_k": 0,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
     "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
-    "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
+    "fused": False,          # fused decode GEMMs (closed with small_gemm)
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
-    "probe": "async",        # child-process probe of the NEW GEMM kernels, started before weight load, own cache dir
+    "probe": False,          # child-process probe (only needed for the closed GEMM line)
+    "layout_auto": True,     # benchmark cuBLAS x@W^T vs x@W_t (pre-transposed copy) per shape at warmup, decode and prefill
     "probe_timeout_s": 130,   # wall-clock since the child started; a hung compile is killed and never touches the parent cache
     "calibration_sleep_s": 0,   # DIAGNOSTIC: extra sleep at load to measure the warmup deadline
 }
@@ -164,6 +165,8 @@ class Engine:
         self.gemm_choice = {}  # (M, N, K) -> cfg or None (cuBLAS)
 
         self.probe_proc = None
+        self.layout_t = {"decode": set(), "prefill": set()}   # weight names using the transposed copy
+        self.w_t = {}                                          # (layer idx or 'lm', name) -> transposed weight
         if CONFIG["probe"] == "async" and self.is_cuda:
             self._start_probe_async()
         self._load_weights(model_path)
@@ -332,6 +335,74 @@ class Engine:
 
     def _over_budget(self):
         return time.time() - self.t_start > CONFIG["warmup_budget_s"]
+
+    _W_NAMES = ("w_qkv", "w_o", "w_gu", "w_down")
+
+    def _mm(self, x, w, name, layer):
+        """x @ w.T via the cuBLAS layout chosen at warmup for this (phase, weight)."""
+        phase = "decode" if x.shape[0] <= 16 else "prefill"
+        if name in self.layout_t[phase]:
+            wt = self.w_t.get((layer, name))
+            if wt is None:
+                wt = w.t().contiguous()
+                self.w_t[(layer, name)] = wt
+            return torch.matmul(x, wt)
+        return F.linear(x, w)
+
+    def _choose_layouts(self, B, S):
+        """Time F.linear (x @ W^T, 'NT') against torch.matmul with a transposed copy ('NN') per weight shape.
+
+        Same arithmetic (fp32-accumulated bf16 GEMM) either way; cuBLAS just picks
+        a different kernel per layout, and at tiny M or huge M one can be much
+        faster. Runs once per process during warmup; no Triton involved.
+        """
+        if not self.is_cuda or not CONFIG["layout_auto"] or getattr(self, "_layouts_done", False):
+            return
+        self._layouts_done = True
+        first = self.layers[0]
+        report = []
+        for phase, M in (("decode", B), ("prefill", min(B * S, 16384))):
+            for name in self._W_NAMES + ("lm_head",):
+                w = self.lm_head if name == "lm_head" else getattr(first, name)
+                if phase == "prefill" and name == "lm_head":
+                    continue  # prefill runs the LM head on B rows only
+                K = w.shape[1]
+                x = torch.randn((M, K), dtype=torch.bfloat16, device=self.device)
+                wt = w.t().contiguous()
+
+                def bench(fn, reps=6):
+                    fn()
+                    torch.cuda.synchronize()
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(reps):
+                        fn()
+                    end.record()
+                    torch.cuda.synchronize()
+                    return start.elapsed_time(end) / reps
+
+                try:
+                    t_nt = bench(lambda: F.linear(x, w))
+                    t_nn = bench(lambda: torch.matmul(x, wt))
+                except Exception as error:  # noqa: BLE001
+                    _log(f"layout bench {phase} {name} failed: {error!r}")
+                    continue
+                if t_nn < t_nt * 0.97:
+                    self.layout_t[phase].add(name)
+                report.append(f"{phase}/{name}: NT {t_nt:.3f} NN {t_nn:.3f}{' ->NN' if name in self.layout_t[phase] else ''}")
+                del wt, x
+                if self._over_budget():
+                    break
+        _log("cuBLAS layouts: " + "; ".join(report))
+        self.diag.append("layouts " + " ".join(f"{p}:{sorted(v)}" for p, v in self.layout_t.items()))
+        # Materialise the transposed copies that will be used (memory: <= one extra weight set).
+        for idx, w in enumerate(self.layers):
+            for name in self._W_NAMES:
+                if name in self.layout_t["decode"] or name in self.layout_t["prefill"]:
+                    self.w_t[(idx, name)] = getattr(w, name).t().contiguous()
+        if "lm_head" in self.layout_t["decode"]:
+            self.w_t[("lm", "lm_head")] = self.lm_head.t().contiguous()
+        torch.cuda.synchronize()
 
     def _certify_ops(self, B, T):
         """Run one decode step on the production shapes, comparing every Triton op with its twin.
@@ -791,6 +862,7 @@ class Engine:
             _log(f"state B={B} CAP={cap} splits={self.num_splits} spec_k={k} "
                  f"kv={2 * self.L * B * self.Nkv * cap * self.D * 2 / 2**30:.2f}GiB")
         if self.is_cuda:
+            self._choose_layouts(B, S)
             if not self.certified:
                 self._certify_ops(B, 1)
                 if k:
@@ -1033,19 +1105,19 @@ class Engine:
                 n = ops["rms_norm"](x, w.ln1, self.eps)
             else:
                 h, n = ops["add_rms_norm"](h, d, w.ln1, self.eps)
-            qkv = self._lin(n, w.w_qkv)
+            qkv = self._mm(n, w.w_qkv, 'w_qkv', l)
             q = ops["qk_norm_rope_cache"](
                 qkv, w.q_norm, w.k_norm, self.eps, self.cos_tab, self.sin_tab, pos, T,
                 self.k_cache[l], self.v_cache[l],
             )
             a = ops["attn_decode"](q, self.k_cache[l], self.v_cache[l], lengths, self.scale, self.num_splits)
-            o = self._lin(a.view(M, -1), w.w_o)
+            o = self._mm(a.view(M, -1), w.w_o, 'w_o', l)
             h, n = ops["add_rms_norm"](h, o, w.ln2, self.eps)
-            gu = self._lin(n, w.w_gu)
+            gu = self._mm(n, w.w_gu, 'w_gu', l)
             p = ops["silu_mul"](gu)
-            d = self._lin(p, w.w_down)
+            d = self._mm(p, w.w_down, 'w_down', l)
         _, n = ops["add_rms_norm"](h, d, self.final_norm, self.eps)
-        logits = self._lin(n, self.lm_head)
+        logits = self._mm(n, self.lm_head, 'lm_head', 'lm')
         return logits.argmax(dim=-1)
 
     def _sdpa_gqa(self, qt, k, v):
@@ -1131,16 +1203,16 @@ class Engine:
                 n = ops["rms_norm"](x, w.ln1, self.eps)
             else:
                 h, n = ops["add_rms_norm"](h, d, w.ln1, self.eps)
-            qkv = F.linear(n, w.w_qkv)
+            qkv = self._mm(n, w.w_qkv, 'w_qkv', l)
             q = ops["qk_norm_rope_cache"](
                 qkv, w.q_norm, w.k_norm, self.eps, self.cos_tab, self.sin_tab, pos, S, kc, vc,
             )
             a = self._prefill_attention(q, kc[:, :, :S, :], vc[:, :, :S, :])
-            o = F.linear(a, w.w_o)
+            o = self._mm(a, w.w_o, 'w_o', l)
             h, n = ops["add_rms_norm"](h, o, w.ln2, self.eps)
-            gu = F.linear(n, w.w_gu)
+            gu = self._mm(n, w.w_gu, 'w_gu', l)
             p = ops["silu_mul"](gu)
-            d = F.linear(p, w.w_down)
+            d = self._mm(p, w.w_down, 'w_down', l)
         last = torch.arange(Bs, device=self.device) * S + (S - 1)
         h_last = h.index_select(0, last)
         d_last = d.index_select(0, last)
