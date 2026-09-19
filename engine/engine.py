@@ -85,6 +85,7 @@ CONFIG = {
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
     "probe": False,          # child-process kernel probe (slow under gVisor; off)
     "probe_timeout_s": 45,    # only the new GEMM kernels are probed; a hung compile costs at most this
+    "calibration_sleep_s": 60,   # DIAGNOSTIC: extra sleep at load to measure the warmup deadline
 }
 
 
@@ -169,6 +170,8 @@ class Engine:
 
         _log(f"loaded in {time.time() - t0:.1f}s on {self.device}; triton={self.use_triton} graphs={self.use_graphs}")
         self.diag.append(f"load {time.time() - t0:.0f}s triton={self.use_triton} cache={os.environ.get('TRITON_CACHE_DIR', 'default')}")
+        if CONFIG.get("calibration_sleep_s"):
+            time.sleep(CONFIG["calibration_sleep_s"])  # warmup-deadline calibration run only
 
     # ------------------------------------------------------------------ loading
 
