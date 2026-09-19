@@ -74,11 +74,11 @@ CONFIG = {
     "self_test": True,       # verify each Triton kernel against its torch twin at load
     "profile": True,         # print a per-op timing breakdown during warmup
     "small_gemm": "auto",    # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
-    "spec_k": 0,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
+    "spec_k": 4,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
-    "diag": True,            # raise after warmup with a diagnostic summary (the judge hides engine output)
+    "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
 }
 
 
