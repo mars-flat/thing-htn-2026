@@ -37,8 +37,7 @@ BLOCK_M = 16
 
 #: Candidate tile configs (BLOCK_N, BLOCK_K, num_warps, num_stages).
 CONFIGS = (
-    (64, 128, 4, 4),
-    (64, 256, 4, 3),
+    (64, 128, 4, 2),
 )
 
 #: Target program count for split-K selection (two waves of 132 SMs).

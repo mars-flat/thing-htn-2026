@@ -83,7 +83,7 @@ CONFIG = {
     "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
     "probe": True,           # compile + self-test Triton kernels in a child process (a crash there only disables a kernel)
-    "probe_timeout_s": 150,
+    "probe_timeout_s": 45,    # only the new GEMM kernels are probed; a hung compile costs at most this
 }
 
 
@@ -266,9 +266,6 @@ class Engine:
             ("attn_decode", attention, attention.attn_decode),
         ]
         tested = {}
-        if CONFIG["probe"] and self.is_cuda:
-            self.kernel_candidates = [c for c in candidates if getattr(c[1], "HAS_TRITON", False)]
-            candidates = []  # certified later by the child-process probe (first generate call)
         for name, module, fn in candidates:
             if not getattr(module, "HAS_TRITON", False):
                 _log(f"{name}: triton missing, torch twin")
@@ -328,11 +325,8 @@ class Engine:
         return time.time() - self.t_start > CONFIG["warmup_budget_s"]
 
     def _run_probe(self, M, max_T):
-        """Compile + self-test every Triton kernel in a child process (see kernels/probe.py)."""
-        tests = [name for name, _, _ in self.kernel_candidates]
-        names = {"rms_norm": "rmsnorm", "add_rms_norm": "rmsnorm", "silu_mul": "silu",
-                 "qk_norm_rope_cache": "rope", "attn_decode": "attention"}
-        modules = sorted({names[n] for n in tests if n in names})
+        """Compile + self-test the new GEMM kernels in a child process (see kernels/probe.py)."""
+        modules = []
         if self.gemm is not None:
             modules.append("gemm")
         if self.fused is not None:
@@ -343,7 +337,7 @@ class Engine:
         out_path = os.path.join(os.environ.get("TRITON_CACHE_DIR", root if os.access(root, os.W_OK) else "/tmp"),
                                 f"probe_{os.getpid()}_{M}.json")
         remaining = CONFIG["warmup_budget_s"] - (time.time() - self.t_start)
-        timeout = max(30.0, min(float(CONFIG["probe_timeout_s"]), remaining + 30.0))
+        timeout = max(20.0, min(float(CONFIG["probe_timeout_s"]), remaining))
         cmd = [sys.executable, "-m", "kernels.probe", out_path, "--device", str(self.device), "--M", str(M),
                "--H", str(self.H), "--I", str(self.I), "--NQ", str(self.Nq), "--NKV", str(self.Nkv), "--D", str(self.D),
                "--max-T", str(max_T), "--tests", ",".join(modules)]
@@ -379,23 +373,13 @@ class Engine:
 
     def _apply_probe(self, M, max_T):
         """Certify kernels with the child-process probe; anything not certified stays on its torch twin."""
-        if self.probed or not self.kernel_candidates and self.gemm is None and self.fused is None:
+        if self.probed or (self.gemm is None and self.fused is None):
             self.probed = True
             return
         self.probed = True
+        if not CONFIG["probe"]:
+            return  # in-process self-tests happen lazily in _choose_gemms / _choose_fused
         results = self._run_probe(M, max_T) if not self._over_budget() else {}
-        names = {"rms_norm": "rmsnorm", "add_rms_norm": "rmsnorm", "silu_mul": "silu",
-                 "qk_norm_rope_cache": "rope", "attn_decode": "attention"}
-        for name, module, fn in self.kernel_candidates:
-            res = results.get(names[name]) or {}
-            if res.get("ok"):
-                self.ops[name] = fn
-            else:
-                _log(f"{name}: not certified by probe ({str(res)[:160]}); torch twin")
-        if self.ops["attn_decode"] is not torch_ref.ref_attn_decode:
-            from kernels import attention
-
-            self.choose_num_splits = attention.choose_num_splits
         if self.gemm is not None:
             res = results.get("gemm") or {}
             self.gemm_tested[M] = [tuple(c) for c in res.get("good_configs", [])] if res.get("ok") else []

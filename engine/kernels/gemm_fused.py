@@ -52,8 +52,8 @@ HAS_LIBDEVICE = _libdevice is not None
 BLOCK_M = 16
 
 #: (BLOCK_N, BLOCK_K, num_warps, num_stages) candidates, by output width class.
-CONFIGS_WIDE = ((64, 256, 4, 4), (128, 128, 4, 4))       # N >= 4096
-CONFIGS_NARROW = ((16, 256, 4, 4), (32, 256, 4, 4))      # N = 2560
+CONFIGS_WIDE = ((64, 128, 4, 2),)       # N >= 4096
+CONFIGS_NARROW = ((32, 128, 4, 2),)      # N = 2560
 
 if HAS_TRITON:
     if HAS_LIBDEVICE:
