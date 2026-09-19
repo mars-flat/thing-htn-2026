@@ -99,17 +99,20 @@ def choose_num_splits(B: int, Nkv: int, cap: int) -> int:
     splits than there are 64-key tiles).  Fixed per CUDA graph, so it is a
     ``constexpr`` of both kernels.
     """
+    # Independent of ``cap`` on purpose: NUM_SPLITS is a constexpr, so a
+    # cap-dependent choice would compile a new kernel for every capacity.
+    # Empty splits (start >= len) cost one trivial program each.
+    del cap
     bh = max(1, int(B) * int(Nkv))
     s = 1
-    while bh * s < _TARGET_PROGRAMS and s < _MAX_SPLITS:
+    while bh * s < _TARGET_PROGRAMS and s < 32:
         s *= 2
-    tiles = max(1, -(-int(cap) // BLOCK_N))
-    return max(1, min(s, _MAX_SPLITS, tiles))
+    return s
 
 
 if HAS_TRITON:
 
-    @triton.jit
+    @triton.jit(do_not_specialize=[11])  # T: runtime, one binary for T=1 and T=k+1
     def _attn_partial_kernel(
         q_ptr,            # [B, T, Nq, D] bf16
         k_ptr,            # [B, Nkv, CAP, D] bf16
@@ -122,14 +125,13 @@ if HAS_TRITON:
         stride_qb,        # T * Nq * D
         stride_qt,        # Nq * D
         stride_kh,        # CAP * D   (one (b, kvh) plane of the cache)
-        T: tl.constexpr,          # new tokens per sequence
+        T,                        # new tokens per sequence (runtime, unspecialised)
         G: tl.constexpr,          # query heads per KV head
         NUM_SPLITS: tl.constexpr,
         BLOCK_M: tl.constexpr,    # 16
         BLOCK_N: tl.constexpr,    # 64
         D: tl.constexpr,          # 128
     ):
-        tl.static_assert(BLOCK_M >= G * T, "G*T query rows must fit in BLOCK_M")
 
         # ---- which (b, kvh, split) am I -------------------------------------
         # int64 program ids so every base offset below is 64-bit; only the
@@ -217,7 +219,7 @@ if HAS_TRITON:
         tl.store(part_ml_ptr + part_row * 2 + 1, l_i)
         tl.store(part_acc_ptr + part_row[:, None] * D + offs_d[None, :], acc)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=[6])  # T: runtime
     def _attn_reduce_kernel(
         part_ml_ptr,      # [B*Nkv, S, BLOCK_M, 2] fp32
         part_acc_ptr,     # [B*Nkv, S, BLOCK_M, D] fp32
@@ -225,7 +227,7 @@ if HAS_TRITON:
         Nkv,              # runtime int
         stride_ob,        # T * Nq * D
         stride_ot,        # Nq * D
-        T: tl.constexpr,
+        T,                # runtime, unspecialised (unused in the body; grid is G*T)
         G: tl.constexpr,
         NUM_SPLITS: tl.constexpr,
         S_POW2: tl.constexpr,     # next_power_of_2(NUM_SPLITS), for the m/l vector loads

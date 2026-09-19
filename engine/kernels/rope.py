@@ -111,7 +111,7 @@ if HAS_TRITON:
         tl.store(dst, o1)
         tl.store(dst + HALF, o2)
 
-    @triton.jit
+    @triton.jit(do_not_specialize=[10, 11])  # T, CAP: runtime, one binary for prefill/decode/verify
     def _qk_norm_rope_cache_kernel(
         qkv_ptr,  # [M, (NQ + 2*NKV) * D] bf16
         qw_ptr,  # [D] bf16

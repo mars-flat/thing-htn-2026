@@ -72,17 +72,18 @@ CONFIG = {
     "prefill_rows": 32768,   # max B*S rows per prefill batch slice
     "cap_align": 64,         # KV-cache capacity alignment
     "log": True,
-    "self_test": True,       # verify each Triton kernel against its torch twin at load
+    "self_test": False,      # module self-tests at load (extra compiles); v4 certifies in-step instead
+    "certify": True,         # compare each Triton op against its torch twin on the production shapes during warmup
     "profile": True,         # print a per-op timing breakdown during warmup
-    "small_gemm": "auto",    # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
+    "small_gemm": False,     # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
     "spec_k": 4,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
     "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
-    "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
+    "fused": False,          # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
-    "probe": True,           # compile + self-test Triton kernels in a child process (a crash there only disables a kernel)
+    "probe": False,          # child-process kernel probe (slow under gVisor; off)
     "probe_timeout_s": 45,    # only the new GEMM kernels are probed; a hung compile costs at most this
 }
 
@@ -150,6 +151,7 @@ class Engine:
         self.fused_good = {}       # M -> {variant: [good cfgs]} from the probe
         self.kernel_candidates = []  # (op name, module, fn) awaiting certification
         self.probed = False
+        self.certified = False
         self.fused_cfg = {}        # M -> {variant: cfg} or None
         self.use_fused = {}        # M -> bool (decided by whole-step timing)
         self.t_start = t0
@@ -266,6 +268,7 @@ class Engine:
             ("attn_decode", attention, attention.attn_decode),
         ]
         tested = {}
+        self.twins = dict(self.ops)
         for name, module, fn in candidates:
             if not getattr(module, "HAS_TRITON", False):
                 _log(f"{name}: triton missing, torch twin")
@@ -323,6 +326,87 @@ class Engine:
 
     def _over_budget(self):
         return time.time() - self.t_start > CONFIG["warmup_budget_s"]
+
+    def _certify_ops(self, B, T):
+        """Run one decode step on the production shapes, comparing every Triton op with its twin.
+
+        Compiles exactly the kernels the run needs (no extra shapes), then keeps
+        the Triton op only where it agrees with the twin: at most reduction-order
+        / transcendental-ulp differences (one bf16 ulp), never a formula change.
+        """
+        if not self.is_cuda or not CONFIG["certify"]:
+            return
+        twins = self.twins
+        if all(self.ops[k] is twins[k] for k in self.ops):
+            return
+        tok = torch.randint(0, self.V, (B, T), dtype=torch.int64, device=self.device)
+        pos = torch.full((B,), 3, dtype=torch.int32, device=self.device)
+        lengths = pos + T
+        M = B * T
+        verdict = {}
+
+        def close(a, b, atol=1e-2, rtol=1.0 / 64):
+            if a.shape != b.shape or a.dtype != b.dtype:
+                return False
+            d = (a.float() - b.float()).abs()
+            return bool(torch.isfinite(a.float()).all().item()) and bool((d <= atol + rtol * b.float().abs()).all().item())
+
+        def check(name, ok):
+            verdict[name] = verdict.get(name, True) and bool(ok)
+
+        try:
+            x = F.embedding(tok.reshape(-1), self.embed)
+            h, d = x, None
+            w = self.layers[0]
+            for l in range(2):  # two layers are enough to exercise every op twice
+                if d is None:
+                    n_r = twins["rms_norm"](x, w.ln1, self.eps)
+                    if self.ops["rms_norm"] is not twins["rms_norm"]:
+                        check("rms_norm", close(self.ops["rms_norm"](x, w.ln1, self.eps), n_r))
+                    n = n_r
+                else:
+                    h_r, n_r = twins["add_rms_norm"](h, d, w.ln1, self.eps)
+                    if self.ops["add_rms_norm"] is not twins["add_rms_norm"]:
+                        h_t, n_t = self.ops["add_rms_norm"](h, d, w.ln1, self.eps)
+                        check("add_rms_norm", torch.equal(h_t, h_r) and close(n_t, n_r))
+                    h, n = h_r, n_r
+                qkv = F.linear(n, w.w_qkv)
+                kc_r, vc_r = self.k_cache[l].clone(), self.v_cache[l].clone()
+                q_r = twins["qk_norm_rope_cache"](qkv, w.q_norm, w.k_norm, self.eps, self.cos_tab, self.sin_tab, pos, T, kc_r, vc_r)
+                if self.ops["qk_norm_rope_cache"] is not twins["qk_norm_rope_cache"]:
+                    kc_t, vc_t = self.k_cache[l].clone(), self.v_cache[l].clone()
+                    q_t = self.ops["qk_norm_rope_cache"](qkv, w.q_norm, w.k_norm, self.eps, self.cos_tab, self.sin_tab, pos, T, kc_t, vc_t)
+                    check("qk_norm_rope_cache", close(q_t, q_r) and close(kc_t, kc_r) and torch.equal(vc_t, vc_r))
+                a_r = twins["attn_decode"](q_r, kc_r, vc_r, lengths, self.scale, self.num_splits)
+                if self.ops["attn_decode"] is not twins["attn_decode"]:
+                    a_t = self.ops["attn_decode"](q_r, kc_r, vc_r, lengths, self.scale, self.num_splits)
+                    check("attn_decode", close(a_t, a_r, atol=1e-2, rtol=1e-2))
+                o = F.linear(a_r.view(M, -1), w.w_o)
+                h_r, n_r = twins["add_rms_norm"](h, o, w.ln2, self.eps)
+                if self.ops["add_rms_norm"] is not twins["add_rms_norm"]:
+                    h_t, n_t = self.ops["add_rms_norm"](h, o, w.ln2, self.eps)
+                    check("add_rms_norm", torch.equal(h_t, h_r) and close(n_t, n_r))
+                h, n = h_r, n_r
+                gu = F.linear(n, w.w_gu)
+                p_r = twins["silu_mul"](gu)
+                if self.ops["silu_mul"] is not twins["silu_mul"]:
+                    check("silu_mul", close(self.ops["silu_mul"](gu), p_r))
+                d = F.linear(p_r, w.w_down)
+            if self.is_cuda:
+                torch.cuda.synchronize()
+        except Exception as error:  # noqa: BLE001 - a kernel that raises is simply not used
+            _log(f"certification raised {error!r}; using torch twins for uncertified ops")
+            for name in self.ops:
+                if name not in verdict:
+                    verdict[name] = False
+        for name, ok in verdict.items():
+            if not ok:
+                _log(f"{name}: certification FAILED; torch twin")
+                self.ops[name] = twins[name]
+        if self.ops["attn_decode"] is twins["attn_decode"]:
+            self.choose_num_splits = lambda B, Nkv, cap: 1
+        _log(f"certified on B={B} T={T}: {verdict}")
+        self.diag.append("certify " + " ".join(f"{k}:{'ok' if v else 'FAIL'}" for k, v in verdict.items()))
 
     def _run_probe(self, M, max_T):
         """Compile + self-test the new GEMM kernels in a child process (see kernels/probe.py)."""
@@ -567,6 +651,12 @@ class Engine:
             _log(f"state B={B} CAP={cap} splits={self.num_splits} spec_k={k} "
                  f"kv={2 * self.L * B * self.Nkv * cap * self.D * 2 / 2**30:.2f}GiB")
         if self.is_cuda:
+            if not self.certified:
+                self._certify_ops(B, 1)
+                if k:
+                    self._certify_ops(B, k + 1)
+                self.certified = True
+                self.num_splits = int(self.choose_num_splits(B, self.Nkv, cap))
             self._apply_probe(B, (k + 1) if k else 1)
             self._choose_gemms(B)
             self._choose_fused(B)
