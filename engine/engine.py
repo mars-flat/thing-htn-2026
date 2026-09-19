@@ -76,7 +76,7 @@ CONFIG = {
     "certify": True,         # compare each Triton op against its torch twin on the production shapes during warmup
     "profile": True,         # print a per-op timing breakdown during warmup
     "small_gemm": False,     # Triton weight-streaming GEMM for M<=16: "auto" (benchmark vs cuBLAS), True, False
-    "spec_k": 4,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
+    "spec_k": 0,             # exact speculative decoding: number of prompt-lookup draft tokens per step (0 = off)
     "spec_n": 3,             # n-gram length used to look up drafts in the sequence's own history
     "spec_max_batch": 8,     # use speculative decoding only when B <= this (lockstep verify pays off at small B)
     "spec_probe": (24, 6),   # when spec is losing: plain steps between probes, spec steps per probe
@@ -85,7 +85,7 @@ CONFIG = {
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
     "probe": False,          # child-process kernel probe (slow under gVisor; off)
     "probe_timeout_s": 45,    # only the new GEMM kernels are probed; a hung compile costs at most this
-    "calibration_sleep_s": 60,   # DIAGNOSTIC: extra sleep at load to measure the warmup deadline
+    "calibration_sleep_s": 0,   # DIAGNOSTIC: extra sleep at load to measure the warmup deadline
 }
 
 
