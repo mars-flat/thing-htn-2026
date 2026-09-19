@@ -83,8 +83,8 @@ CONFIG = {
     "diag": False,           # raise after warmup with a diagnostic summary (the judge hides engine output)
     "fused": "auto",         # fused decode GEMMs (norm prologue / residual / SwiGLU epilogues): auto = keep if faster
     "warmup_budget_s": 140,  # skip optional warmup work (fused/spec variants) once load+warmup exceeds this
-    "probe": False,          # child-process kernel probe (slow under gVisor; off)
-    "probe_timeout_s": 45,    # only the new GEMM kernels are probed; a hung compile costs at most this
+    "probe": "async",        # child-process probe of the NEW GEMM kernels, started before weight load, own cache dir
+    "probe_timeout_s": 130,   # wall-clock since the child started; a hung compile is killed and never touches the parent cache
     "calibration_sleep_s": 0,   # DIAGNOSTIC: extra sleep at load to measure the warmup deadline
 }
 
@@ -163,6 +163,9 @@ class Engine:
         self.gemm_force = False
         self.gemm_choice = {}  # (M, N, K) -> cfg or None (cuBLAS)
 
+        self.probe_proc = None
+        if CONFIG["probe"] == "async" and self.is_cuda:
+            self._start_probe_async()
         self._load_weights(model_path)
         self._rope_max = 0
         self._ensure_rope(8192)
@@ -411,6 +414,134 @@ class Engine:
         _log(f"certified on B={B} T={T}: {verdict}")
         self.diag.append("certify " + " ".join(f"{k}:{'ok' if v else 'FAIL'}" for k, v in verdict.items()))
 
+    # ------------------------------------------------------------------ async child probe
+
+    def _parent_cache_dir(self):
+        return os.environ.get("TRITON_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".triton", "cache")
+
+    def _start_probe_async(self):
+        """Compile + self-test the new GEMM kernels in a child, overlapping the weight load.
+
+        The child gets its OWN Triton cache directory, so killing it mid-compile
+        can never leave a partial entry or lock in the parent's cache; on success
+        its entries are merged into the parent's cache and the parent's launches
+        become cache hits. A success marker skips the child in later workloads
+        of the same run (same container).
+        """
+        try:
+            from kernels import gemm, gemm_fused  # noqa: F401
+
+            mode_g = os.environ.get("DRYFT_ENGINE_SMALL_GEMM", CONFIG["small_gemm"])
+            mode_f = os.environ.get("DRYFT_ENGINE_FUSED", CONFIG["fused"])
+            tests = []
+            if mode_g not in (False, "0", "false", "off") and gemm.HAS_TRITON:
+                tests.append("gemm")
+            if mode_f not in (False, "0", "false", "off") and gemm_fused.HAS_TRITON:
+                tests.append("fused")
+            if not tests:
+                return
+            root = os.path.dirname(os.path.abspath(__file__))
+            parent_cache = self._parent_cache_dir()
+            os.makedirs(parent_cache, exist_ok=True)
+            self.probe_dir = os.path.join(parent_cache, "engine_probe")
+            self.probe_marker = os.path.join(self.probe_dir, "certified.json")
+            self.probe_tests = tests
+            if os.path.exists(self.probe_marker):
+                _log("probe: reusing certified results from an earlier workload")
+                return
+            import shutil
+
+            shutil.rmtree(self.probe_dir, ignore_errors=True)
+            os.makedirs(self.probe_dir, exist_ok=True)
+            child_cache = os.path.join(self.probe_dir, "cache")
+            os.makedirs(child_cache, exist_ok=True)
+            self.probe_out = os.path.join(self.probe_dir, "result.json")
+            env = dict(os.environ)
+            env["TRITON_CACHE_DIR"] = child_cache
+            env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            # M is not known yet (B arrives with the first generate); test the
+            # three integer specialisations Triton distinguishes (1, generic, %16).
+            cmd = [sys.executable, "-m", "kernels.probe", self.probe_out, "--device", str(self.device),
+                   "--M", "1", "--H", str(self.H), "--I", str(self.I), "--NQ", str(self.Nq), "--NKV", str(self.Nkv),
+                   "--D", str(self.D), "--tests", ",".join(tests)]
+            self.probe_started = time.time()
+            self.probe_proc = subprocess.Popen(cmd, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            _log(f"probe: started child for {tests} (own cache {child_cache})")
+        except Exception as error:  # noqa: BLE001
+            _log(f"probe: could not start ({error!r})")
+            self.probe_proc = None
+
+    def _finish_probe_async(self, M):
+        """Wait (bounded) for the child, merge its cache on success, record certified configs."""
+        if not hasattr(self, "probe_dir"):
+            return
+        results = None
+        if os.path.exists(self.probe_marker):
+            try:
+                with open(self.probe_marker) as handle:
+                    results = json.load(handle)
+            except Exception:  # noqa: BLE001
+                results = None
+        elif self.probe_proc is not None:
+            deadline = self.probe_started + float(CONFIG["probe_timeout_s"])
+            remaining = deadline - time.time()
+            status = "ok"
+            try:
+                self.probe_proc.wait(timeout=max(1.0, remaining))
+                if self.probe_proc.returncode != 0:
+                    status = f"exit {self.probe_proc.returncode}"
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+                self.probe_proc.kill()
+                try:
+                    self.probe_proc.wait(timeout=10)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                tail = (self.probe_proc.stderr.read() or "")[-500:]
+            except Exception:  # noqa: BLE001
+                tail = ""
+            _log(f"probe: child {status} after {time.time() - self.probe_started:.0f}s; stderr tail {tail!r}")
+            self.diag.append(f"probe {status} {time.time() - self.probe_started:.0f}s")
+            if status == "ok":
+                try:
+                    with open(self.probe_out) as handle:
+                        data = json.load(handle)
+                    if data.get("ok"):
+                        results = data.get("results", {})
+                        # merge the child's compiled kernels into the parent's cache
+                        import shutil
+
+                        child_cache = os.path.join(self.probe_dir, "cache")
+                        parent_cache = self._parent_cache_dir()
+                        n = 0
+                        for entry in os.listdir(child_cache):
+                            src, dst = os.path.join(child_cache, entry), os.path.join(parent_cache, entry)
+                            if os.path.isdir(src) and not os.path.exists(dst):
+                                shutil.copytree(src, dst)
+                                n += 1
+                        with open(self.probe_marker, "w") as handle:
+                            json.dump(results, handle, default=str)
+                        _log(f"probe: merged {n} cache entries; certified {[k for k, v in results.items() if v.get('ok')]}")
+                except Exception as error:  # noqa: BLE001
+                    _log(f"probe: could not read/merge results ({error!r})")
+                    results = None
+            self.probe_proc = None
+        if not results:
+            _log("probe: nothing certified; gemm/fused disabled")
+            self.gemm = None
+            self.fused = None
+            return
+        res = results.get("gemm") or {}
+        self.gemm_tested[M] = [tuple(c) for c in res.get("good_configs", [])] if res.get("ok") else []
+        if not self.gemm_tested[M]:
+            self.gemm = None
+        res = results.get("fused") or {}
+        if res.get("ok"):
+            self.fused_good[M] = {k: [tuple(c) for c in v.get("good", [])] for k, v in res.get("variants", {}).items()}
+        else:
+            self.fused = None
+
     def _run_probe(self, M, max_T):
         """Compile + self-test the new GEMM kernels in a child process (see kernels/probe.py)."""
         modules = []
@@ -464,7 +595,7 @@ class Engine:
             self.probed = True
             return
         self.probed = True
-        if not CONFIG["probe"]:
+        if not CONFIG["probe"] or CONFIG["probe"] == "async":
             return  # in-process self-tests happen lazily in _choose_gemms / _choose_fused
         results = self._run_probe(M, max_T) if not self._over_budget() else {}
         if self.gemm is not None:
@@ -666,7 +797,10 @@ class Engine:
                     self._certify_ops(B, k + 1)
                 self.certified = True
                 self.num_splits = int(self.choose_num_splits(B, self.Nkv, cap))
-            self._apply_probe(B, (k + 1) if k else 1)
+            if CONFIG["probe"] == "async":
+                self._finish_probe_async(B)
+            else:
+                self._apply_probe(B, (k + 1) if k else 1)
             self._choose_gemms(B)
             self._choose_fused(B)
             if k:
